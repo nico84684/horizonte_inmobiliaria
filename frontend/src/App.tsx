@@ -6,18 +6,26 @@ import logo from '/logoHorizonte.png';
 const BACKEND_URL = 'http://localhost:5000';
 const socket = io(BACKEND_URL);
 
-type ActionType = 'full' | 'clean' | 'convert';
+type ActionType = 'full' | 'clean' | 'convert' | 'pricing';
+type TabKey = 'pipeline' | 'pricing' | 'docs';
+
+const PROPERTY_TYPES = ['Departamento', 'Casa', 'PH', 'Oficina', 'Local', 'Terreno'];
+const OPERATIONS = ['Venta', 'Alquiler'];
+const PROVINCIAS = ['Buenos Aires', 'CABA'];
+const PARTIDOS = ['CABA', 'Vicente López', 'San Isidro', 'Tigre', 'La Plata'];
 
 const ACTION_LABELS: Record<ActionType, string> = {
   full: 'Pipeline completo',
   clean: 'Limpieza',
   convert: 'Conversión',
+  pricing: 'Dataset de pricing',
 };
 
 const ACTION_EVENT: Record<ActionType, string> = {
   full: 'run_full',
   clean: 'run_clean',
   convert: 'run_convert',
+  pricing: 'run_pricing_dataset',
 };
 
 function App() {
@@ -26,11 +34,39 @@ function App() {
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const [progress, setProgress] = useState<number>(0);
   const [currentAction, setCurrentAction] = useState<ActionType | null>(null);
+  const [activeTab, setActiveTab] = useState<TabKey>('pipeline');
   const [trainingFile, setTrainingFile] = useState<File | null>(null);
   const [dolarFile, setDolarFile] = useState<File | null>(null);
   const [uploadStatus, setUploadStatus] = useState<string>('');
   const [uploading, setUploading] = useState<boolean>(false);
   const [sources, setSources] = useState<{ training_path?: string | null; dolar_path?: string | null }>({});
+  const [pricingDataset, setPricingDataset] = useState<{ last_updated: string | null; rows: number | null; path: string | null }>({
+    last_updated: null,
+    rows: null,
+    path: null,
+  });
+  const [trainingModel, setTrainingModel] = useState<{ loading: boolean; message: string }>({
+    loading: false,
+    message: '',
+  });
+  const [predictForm, setPredictForm] = useState({
+    tipo_propiedad: 'Departamento',
+    tipo_operacion: 'Venta',
+    ambientes: '2',
+    dormitorios: '1',
+    banios: '1',
+    superficie_total: '50',
+    superficie_cubierta: '45',
+    latitud: '',
+    longitud: '',
+    partido: '',
+    provincia: '',
+    localidad: '',
+    fecha_publicacion: '',
+    precio_publicado: '',
+  });
+  const [predictLoading, setPredictLoading] = useState(false);
+  const [predictResult, setPredictResult] = useState<{ predicted_price: number; price_min: number; price_max: number; delta_vs_publicado_pct?: number | null } | null>(null);
   const statusLogRef = useRef<HTMLDivElement>(null);
 
   const businessMessage = (raw: string) => {
@@ -49,6 +85,11 @@ function App() {
       { match: 'pipeline finalizado', text: 'Pipeline listo. Datos actualizados.' },
       { match: 'etapa clean finalizada', text: 'Limpieza lista. Datos depurados.' },
       { match: 'etapa convert finalizada', text: 'Conversión lista. Precios unificados.' },
+      { match: 'armado de dataset de pricing', text: 'Preparando el dataset para el modelo de precios.' },
+      { match: 'archivo base cargado', text: 'Usando el dataset limpio para derivar variables de pricing.' },
+      { match: 'mi_dan', text: 'Integrando el índice MI_DAN como referencia de m².' },
+      { match: 'dataset de pricing', text: 'Dataset para pricing generado con features listas.' },
+      { match: 'no se encontró mi_dan', text: 'No se halló MI_DAN_AX03.xlsx. Se generará sin ese índice.' },
       { match: 'error', text: 'Se detectó un problema. Revisar los datos de origen.' },
     ];
 
@@ -79,11 +120,39 @@ function App() {
         .catch(() => setSources({}));
     };
 
+    const fetchPricingDataset = () => {
+      fetch(`${BACKEND_URL}/api/pricing-dataset`)
+        .then(res => res.json())
+        .then(data => {
+          setPricingDataset({
+            last_updated: data.last_updated ?? null,
+            rows: data.rows ?? null,
+            path: data.path ?? null,
+          });
+        })
+        .catch(() => {
+          setPricingDataset({
+            last_updated: null,
+            rows: null,
+            path: null,
+          });
+        });
+    };
+
     fetchLastExecution();
     fetchSources();
+    fetchPricingDataset();
 
     const onConnect = () => {
       console.log('Conectado al servidor de Socket.IO');
+    };
+
+    const onPricingDatasetReady = (data: { path?: string; rows?: number; last_updated?: string | null }) => {
+      setPricingDataset({
+        last_updated: data.last_updated ?? new Date().toLocaleString('es-AR'),
+        rows: data.rows ?? null,
+        path: data.path ?? null,
+      });
     };
 
     const onStatusMessage = (data: { message: string; action?: ActionType }) => {
@@ -105,11 +174,13 @@ function App() {
     socket.on('connect', onConnect);
     socket.on('status', onStatusMessage);
     socket.on('pipeline_finished', onPipelineFinished);
+    socket.on('pricing_dataset_ready', onPricingDatasetReady);
 
     return () => {
       socket.off('connect', onConnect);
       socket.off('status', onStatusMessage);
       socket.off('pipeline_finished', onPipelineFinished);
+      socket.off('pricing_dataset_ready', onPricingDatasetReady);
     };
   }, []);
 
@@ -118,6 +189,86 @@ function App() {
       statusLogRef.current.scrollTop = statusLogRef.current.scrollHeight;
     }
   }, [statusMessages]);
+
+  const handlePredictChange = (field: string, value: string) => {
+    setPredictForm(prev => ({ ...prev, [field]: value }));
+  };
+
+  const scrollToDoc = (id: string) => {
+    const el = document.getElementById(id);
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  };
+
+  const handlePredict = () => {
+    setPredictLoading(true);
+    setPredictResult(null);
+
+    const payload: Record<string, any> = {
+      tipo_propiedad: predictForm.tipo_propiedad,
+      tipo_operacion: predictForm.tipo_operacion,
+      ambientes: predictForm.ambientes ? Number(predictForm.ambientes) : null,
+      dormitorios: predictForm.dormitorios ? Number(predictForm.dormitorios) : null,
+      banios: predictForm.banios ? Number(predictForm.banios) : null,
+      superficie_total: predictForm.superficie_total ? Number(predictForm.superficie_total) : null,
+      superficie_cubierta: predictForm.superficie_cubierta ? Number(predictForm.superficie_cubierta) : null,
+      latitud: predictForm.latitud ? Number(predictForm.latitud) : null,
+      longitud: predictForm.longitud ? Number(predictForm.longitud) : null,
+      partido: predictForm.partido,
+      provincia: predictForm.provincia,
+      localidad: predictForm.localidad,
+      fecha_publicacion: predictForm.fecha_publicacion,
+    };
+
+    if (predictForm.precio_publicado) {
+      payload.precio_publicado = Number(predictForm.precio_publicado);
+    }
+
+    fetch(`${BACKEND_URL}/api/price-predict`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+      .then(res => res.json())
+      .then(data => {
+        if (data.error) {
+          setPredictResult(null);
+          setStatusMessages(prev => [...prev, data.error]);
+        } else {
+          setPredictResult(data);
+        }
+      })
+      .catch(() => {
+        setPredictResult(null);
+        setStatusMessages(prev => [...prev, 'No se pudo obtener la predicción.']);
+      })
+      .finally(() => setPredictLoading(false));
+  };
+
+  const handleRetrainModel = () => {
+    setTrainingModel({ loading: true, message: 'Entrenando modelo...' });
+    fetch(`${BACKEND_URL}/api/train-pricing-model`, { method: 'POST' })
+      .then(res => res.json())
+      .then(data => {
+        if (data.error) {
+          setTrainingModel({ loading: false, message: data.error });
+          setStatusMessages(prev => [...prev, data.error]);
+        } else {
+          const mae = data.metrics?.overall?.mae ?? data.metrics?.mae;
+          const mape = data.metrics?.overall?.mape_pct ?? data.metrics?.mape_pct;
+          const maeTxt = typeof mae === 'number' ? mae.toFixed(0) : '-';
+          const mapeTxt = typeof mape === 'number' ? `${mape.toFixed(2)}%` : '-';
+          const msg = `Modelo entrenado. MAE: ${maeTxt} | MAPE: ${mapeTxt}`;
+          setTrainingModel({ loading: false, message: msg });
+          setStatusMessages(prev => [...prev, msg]);
+        }
+      })
+      .catch(() => {
+        setTrainingModel({ loading: false, message: 'No se pudo entrenar el modelo.' });
+        setStatusMessages(prev => [...prev, 'No se pudo entrenar el modelo.']);
+      });
+  };
 
   const handleUploadSources = () => {
     if (!trainingFile && !dolarFile) {
@@ -192,6 +343,20 @@ function App() {
       </div>
 
       <main className="content">
+        <div className="tabs">
+          <button className={`tab-button ${activeTab === 'pipeline' ? 'active' : ''}`} onClick={() => setActiveTab('pipeline')}>
+            Pipeline
+          </button>
+          <button className={`tab-button ${activeTab === 'pricing' ? 'active' : ''}`} onClick={() => setActiveTab('pricing')}>
+            Pricing
+          </button>
+          <button className={`tab-button ${activeTab === 'docs' ? 'active' : ''}`} onClick={() => setActiveTab('docs')}>
+            Documentación
+          </button>
+        </div>
+
+        {activeTab === 'pipeline' && (
+          <>
         <section className="split">
           <div className="card upload">
             <p className="card-label">Fuentes de datos</p>
@@ -272,7 +437,6 @@ function App() {
             </div>
           </div>
         </section>
-
         <section className="status-section">
           <div className="section-header">
             <div>
@@ -297,6 +461,263 @@ function App() {
             )}
           </div>
         </section>
+        </>
+        )}
+
+        {activeTab === 'pricing' && (
+        <section className="pricing-section">
+          <div className="section-header pricing-header">
+            <div>
+              <p className="card-label">Modelo de precios</p>
+              <h3>¿A qué precio debo publicar una propiedad?</h3>
+              <p className="card-hint">
+                Evita fijar precios solo por percepción: el dataset se arma con variables de ubicación, metraje y mercado para alimentar el modelo de regresión / random forest.
+              </p>
+            </div>
+            <div className="kpi-card">
+              <p className="card-label small">KPI</p>
+              <p className="card-value small">Δ precio publicado vs modelo (%)</p>
+              <p className="mini">Buscamos reducir el desvío y acelerar la rotación.</p>
+            </div>
+          </div>
+
+          <div className="pricing-grid">
+            <div className="card pricing-story">
+              <p className="card-label">Problemática</p>
+              <h4>Decisiones de precio subjetivas</h4>
+              <p className="card-hint">
+                Los agentes suelen fijar precios de publicación por percepción o pedido del propietario, lo que genera ineficiencias.
+              </p>
+              <ul className="mini-list">
+                <li>Propiedades sobrevaluadas que no se venden.</li>
+                <li>Publicaciones subvaluadas que reducen margen o comisión.</li>
+                <li>Rotación ineficiente del inventario.</li>
+              </ul>
+              <div className="value-box">
+                <p className="card-label">Solución con el modelo</p>
+                <p className="card-hint">
+                  Estima el precio óptimo usando ubicación, superficie, ambientes, tipo de propiedad, índice MI_DAN_AX03 y variables derivadas (distancias, densidad comercial, etc.).
+                </p>
+              </div>
+            </div>
+
+            <div className="card pricing-actions">
+              <p className="card-label">Dataset del modelo</p>
+              <h2>Generar dataset de pricing</h2>
+              <p className="card-hint">
+                Construye el CSV con las variables clave para entrenar el modelo y calcular el precio publicado recomendado.
+              </p>
+              <div className="feature-chips">
+                <span className="chip">Ubicación (barrio + coordenadas)</span>
+                <span className="chip">Superficie total y cubierta</span>
+                <span className="chip">Ambientes y tipo de propiedad</span>
+                <span className="chip">Índice MI_DAN_AX03</span>
+                <span className="chip">Precio USD y $/m² publicado</span>
+              </div>
+              <div className="dataset-meta">
+                <div>
+                  <p className="mini">Última generación</p>
+                  <p className="stat-value">{pricingDataset.last_updated || 'Aún no generado'}</p>
+                </div>
+                <div>
+                  <p className="mini">Filas útiles</p>
+                  <p className="stat-value">
+                    {pricingDataset.rows !== null && pricingDataset.rows !== undefined
+                      ? pricingDataset.rows.toLocaleString()
+                      : 'Sin dato'}
+                  </p>
+                </div>
+              </div>
+              <p className="mini">Destino: {pricingDataset.path || 'backend/pricing_dataset.csv'}</p>
+              <button onClick={() => handleRun('pricing')} disabled={isRunning} className="run-button">
+                {isRunning && currentAction === 'pricing' ? 'Procesando...' : 'Crear dataset de pricing'}
+              </button>
+              <button onClick={handleRetrainModel} disabled={trainingModel.loading} className="secondary-button">
+                {trainingModel.loading ? 'Entrenando modelo...' : 'Reentrenar modelo'}
+              </button>
+              <p className="mini status">{trainingModel.message}</p>
+              <p className="mini status">
+                Ejecuta antes el pipeline completo para asegurar datos limpios y actualizados.
+              </p>
+            </div>
+
+            <div className="card pricing-simulator">
+              <p className="card-label">Simulador</p>
+              <h2>Calcular precio recomendado</h2>
+              <p className="card-hint">Ingresa los datos clave de la propiedad. El campo "Precio que planeo publicar" es opcional para ver el desvío.</p>
+
+              <div className="form-grid">
+                <label>
+                  Tipo de propiedad
+                  <select value={predictForm.tipo_propiedad} onChange={e => handlePredictChange('tipo_propiedad', e.target.value)}>
+                    {PROPERTY_TYPES.map(opt => (
+                      <option key={opt} value={opt}>{opt}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Operación
+                  <select value={predictForm.tipo_operacion} onChange={e => handlePredictChange('tipo_operacion', e.target.value)}>
+                    {OPERATIONS.map(opt => (
+                      <option key={opt} value={opt}>{opt}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Ambientes
+                  <input type="number" value={predictForm.ambientes} onChange={e => handlePredictChange('ambientes', e.target.value)} />
+                </label>
+                <label>
+                  Dormitorios
+                  <input type="number" value={predictForm.dormitorios} onChange={e => handlePredictChange('dormitorios', e.target.value)} />
+                </label>
+                <label>
+                  Baños
+                  <input type="number" value={predictForm.banios} onChange={e => handlePredictChange('banios', e.target.value)} />
+                </label>
+                <label>
+                  Superficie total (m²)
+                  <input type="number" value={predictForm.superficie_total} onChange={e => handlePredictChange('superficie_total', e.target.value)} />
+                </label>
+                <label>
+                  Superficie cubierta (m²)
+                  <input type="number" value={predictForm.superficie_cubierta} onChange={e => handlePredictChange('superficie_cubierta', e.target.value)} />
+                </label>
+                <label>
+                  Provincia
+                  <select value={predictForm.provincia} onChange={e => handlePredictChange('provincia', e.target.value)}>
+                    <option value="">Selecciona</option>
+                    {PROVINCIAS.map(opt => (
+                      <option key={opt} value={opt}>{opt}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Partido
+                  <select value={predictForm.partido} onChange={e => handlePredictChange('partido', e.target.value)}>
+                    <option value="">Selecciona</option>
+                    {PARTIDOS.map(opt => (
+                      <option key={opt} value={opt}>{opt}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Localidad (opcional)
+                  <input value={predictForm.localidad} onChange={e => handlePredictChange('localidad', e.target.value)} />
+                </label>
+                <label>
+                  Latitud
+                  <input type="number" value={predictForm.latitud} onChange={e => handlePredictChange('latitud', e.target.value)} placeholder="-34.60" />
+                </label>
+                <label>
+                  Longitud
+                  <input type="number" value={predictForm.longitud} onChange={e => handlePredictChange('longitud', e.target.value)} placeholder="-58.44" />
+                </label>
+                <label>
+                  Fecha de publicación
+                  <input type="date" value={predictForm.fecha_publicacion} onChange={e => handlePredictChange('fecha_publicacion', e.target.value)} />
+                </label>
+                <label>
+                  Precio que planeo publicar (USD, opcional)
+                  <input type="number" value={predictForm.precio_publicado} onChange={e => handlePredictChange('precio_publicado', e.target.value)} />
+                </label>
+              </div>
+
+              <button className="run-button" onClick={handlePredict} disabled={predictLoading}>
+                {predictLoading ? 'Calculando...' : 'Calcular precio'}
+              </button>
+
+              {predictResult && (
+                <div className="result-box">
+                  <p className="card-label">Resultado</p>
+                  <h3 className="stat-value">USD {predictResult.predicted_price.toLocaleString()}</h3>
+                  <p className="mini">Rango sugerido: USD {predictResult.price_min.toLocaleString()} - {predictResult.price_max.toLocaleString()}</p>
+                  {predictResult.delta_vs_publicado_pct !== null && predictResult.delta_vs_publicado_pct !== undefined && (
+                    <p className="mini">
+                      Diferencia vs tu precio: {predictResult.delta_vs_publicado_pct > 0 ? '+' : ''}{predictResult.delta_vs_publicado_pct}%
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        </section>
+        )}
+
+        {activeTab === 'docs' && (
+          <section id="docs" className="docs-section">
+            <div className="section-header">
+              <div>
+                <p className="card-label">Documentación</p>
+                <h3>Cómo usamos los datos y el modelo</h3>
+                <p className="card-hint">Manual extendido para negocio y data, con índice navegable.</p>
+              </div>
+            </div>
+            <div className="doc-index">
+              <span>Índice:</span>
+              <button onClick={() => scrollToDoc('doc-business')} className="doc-link">Guía para negocio</button>
+              <button onClick={() => scrollToDoc('doc-data')} className="doc-link">Modelo y features</button>
+              <button onClick={() => scrollToDoc('doc-metrics')} className="doc-link">Métricas e interpretación</button>
+              <button onClick={() => scrollToDoc('doc-checklist')} className="doc-link">Checklist antes de publicar</button>
+            </div>
+            <div className="docs-grid">
+              <div id="doc-business" className="card docs-card">
+                <p className="card-label">Para negocio</p>
+                <h4>Ruta completa del pipeline</h4>
+                <p className="doc-text">
+                  1) Ingesta: sube el CSV de propiedades y el histórico de dólar (o usa los que ya están). El panel conserva la última versión y la reutiliza si no cargas otra para que todas las corridas usen la misma base.
+                </p>
+                <p className="doc-text">
+                  2) Limpieza: quitamos columnas irrelevantes, corregimos lat/long y filtramos nulos en campos críticos (ubicación, metros, precio, tipo). Así evitamos entrenar con datos incompletos o mal geolocalizados.
+                </p>
+                <p className="doc-text">
+                  3) Conversión: llevamos todos los precios a USD con la cotización de la fecha de publicación y eliminamos outliers extremos en alquiler/venta. 4) Dataset de pricing: derivamos precio USD/m², ratio de superficie cubierta y cruzamos MI_DAN_AX03 por mes y ambientes para capturar el contexto de mercado.
+                </p>
+                <p className="doc-text">
+                  5) Uso operativo: reentrena el modelo y usa el simulador para validar el precio antes de publicar. Si el delta es alto, ajusta o documenta la excepción (amenities premium, vista, ubicación única). Define una banda (ej. ±8%) según estrategia de rotación y margen.
+                </p>
+              </div>
+              <div id="doc-data" className="card docs-card">
+                <p className="card-label">Para data</p>
+                <h4>Modelo, features y entrenamiento</h4>
+                <p className="doc-text">
+                  Modelo: GradientBoostingRegressor (scikit-learn). Preprocesamiento: imputación (mediana en numéricos, valor frecuente en categóricos) y OneHotEncoder en categorías. Features: latitud, longitud, ambientes, dormitorios, baños, superficie_total, superficie_cubierta, ratio_cubierta, tipo_propiedad, tipo_operacion, provincia, partido, mi_dan_ax03. Target: precio_dolares.
+                </p>
+                <p className="doc-text">
+                  Entrenamiento: split 80/20 aleatorio. El modelo se guarda en backend/pricing_model.pkl y se recarga automáticamente al predecir. Si agregas columnas en el dataset de pricing, reentrena con el botón para refrescar el pipeline de features.
+                </p>
+                <p className="doc-text">
+                  Hiperparámetros actuales: GradientBoostingRegressor(random_state=42). Ajustes sugeridos si buscas más performance: aumentar n_estimators y reducir learning_rate; probar max_depth moderado (2-4) y validar que MAE/MAPE no empeoren por sobreajuste.
+                </p>
+                <div className="value-box">
+                  <p className="card-label">Reglas de limpieza previas</p>
+                  <p className="card-hint small">
+                    - Se filtran precios objetivo: sólo precio_dolares &gt; 0. Ventas entre 20k–2M USD; alquileres entre 100–10k USD.<br />
+                    - Se deduplican columnas del CSV y se seleccionan features sin repetir nombres.<br />
+                    - El MAPE se calcula sólo con y_true ≥ 10,000 USD para evitar explosiones por valores muy bajos.
+                  </p>
+                </div>
+              </div>
+              <div id="doc-metrics" className="card docs-card">
+                <p className="card-label">Interpretación</p>
+                <h4>Métricas y lectura</h4>
+                <p className="doc-text">
+                  Métricas reportadas: MAE (error absoluto medio en USD) y MAPE (desvío relativo %). El KPI de negocio (Δ precio publicado vs modelo) muestra qué tan alineado está el precio de salida con la recomendación del modelo.
+                </p>
+                <p className="doc-text">
+                  Si el MAPE sube, revisa: 1) cambios en el mix de propiedades (barrios nuevos, tipologías atípicas), 2) outliers que no se filtraron, 3) necesidad de nuevas variables (amenities, antigüedad, piso, orientación). Reentrena cada vez que cambie la base o las features.
+                </p>
+              </div>
+              <div id="doc-checklist" className="card docs-card">
+                <p className="card-label">Checklist</p>
+                <h4>Antes de publicar</h4>
+                <p className="doc-text">
+                  1) Ejecuta pipeline completo con fuentes actualizadas. 2) Genera dataset de pricing y reentrena el modelo. 3) Simula el precio objetivo y revisa el delta. 4) Define banda de negociación (±8% sugerido) y mensaje comercial. 5) Si el delta es alto, ajusta o documenta la excepción (ej. vista al río, amenities premium).
+                </p>
+              </div>
+            </div>
+          </section>
+        )}
       </main>
     </div>
   );
