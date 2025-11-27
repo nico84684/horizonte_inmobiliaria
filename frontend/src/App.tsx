@@ -7,7 +7,8 @@ const BACKEND_URL = 'http://localhost:5000';
 const socket = io(BACKEND_URL);
 
 type ActionType = 'full' | 'clean' | 'convert' | 'pricing';
-type TabKey = 'pipeline' | 'pricing' | 'dashboard' | 'docs';
+type TabKey = 'pipeline' | 'pricing' | 'dashboard' | 'chatbot' | 'docs';
+type TrainingMetrics = { mae?: number | null; mape_pct?: number | null };
 
 const PROPERTY_TYPES = ['Departamento', 'Casa', 'PH', 'Oficina', 'Local', 'Terreno'];
 const OPERATIONS = ['Venta', 'Alquiler'];
@@ -45,9 +46,10 @@ function App() {
     rows: null,
     path: null,
   });
-  const [trainingModel, setTrainingModel] = useState<{ loading: boolean; message: string }>({
+  const [trainingModel, setTrainingModel] = useState<{ loading: boolean; message: string; metrics?: TrainingMetrics }>({
     loading: false,
     message: '',
+    metrics: undefined,
   });
   const [predictForm, setPredictForm] = useState({
     tipo_propiedad: 'Departamento',
@@ -68,6 +70,8 @@ function App() {
   const [predictLoading, setPredictLoading] = useState(false);
   const [predictResult, setPredictResult] = useState<{ predicted_price: number; price_min: number; price_max: number; delta_vs_publicado_pct?: number | null } | null>(null);
   const statusLogRef = useRef<HTMLDivElement>(null);
+  const dashboardFrameRef = useRef<HTMLIFrameElement | null>(null);
+  const chatbotFrameRef = useRef<HTMLIFrameElement | null>(null);
 
   const businessMessage = (raw: string) => {
     const lower = raw.toLowerCase();
@@ -246,13 +250,39 @@ function App() {
       .finally(() => setPredictLoading(false));
   };
 
+  const handleDashboardFullscreen = () => {
+    const iframe = dashboardFrameRef.current;
+    if (!iframe) return;
+    const elem: any = iframe;
+    if (elem.requestFullscreen) {
+      elem.requestFullscreen();
+    } else if (elem.webkitRequestFullscreen) {
+      elem.webkitRequestFullscreen();
+    } else if (elem.msRequestFullscreen) {
+      elem.msRequestFullscreen();
+    }
+  };
+
+  const handleChatbotFullscreen = () => {
+    const iframe = chatbotFrameRef.current;
+    if (!iframe) return;
+    const elem: any = iframe;
+    if (elem.requestFullscreen) {
+      elem.requestFullscreen();
+    } else if (elem.webkitRequestFullscreen) {
+      elem.webkitRequestFullscreen();
+    } else if (elem.msRequestFullscreen) {
+      elem.msRequestFullscreen();
+    }
+  };
+
   const handleRetrainModel = () => {
     setTrainingModel({ loading: true, message: 'Entrenando modelo...' });
     fetch(`${BACKEND_URL}/api/train-pricing-model`, { method: 'POST' })
       .then(res => res.json())
       .then(data => {
         if (data.error) {
-          setTrainingModel({ loading: false, message: data.error });
+          setTrainingModel({ loading: false, message: data.error, metrics: undefined });
           setStatusMessages(prev => [...prev, data.error]);
         } else {
           const mae = data.metrics?.overall?.mae ?? data.metrics?.mae;
@@ -260,12 +290,16 @@ function App() {
           const maeTxt = typeof mae === 'number' ? mae.toFixed(0) : '-';
           const mapeTxt = typeof mape === 'number' ? `${mape.toFixed(2)}%` : '-';
           const msg = `Modelo entrenado. MAE: ${maeTxt} | MAPE: ${mapeTxt}`;
-          setTrainingModel({ loading: false, message: msg });
+          setTrainingModel({
+            loading: false,
+            message: msg,
+            metrics: { mae: typeof mae === 'number' ? mae : null, mape_pct: typeof mape === 'number' ? mape : null },
+          });
           setStatusMessages(prev => [...prev, msg]);
         }
       })
       .catch(() => {
-        setTrainingModel({ loading: false, message: 'No se pudo entrenar el modelo.' });
+        setTrainingModel({ loading: false, message: 'No se pudo entrenar el modelo.', metrics: undefined });
         setStatusMessages(prev => [...prev, 'No se pudo entrenar el modelo.']);
       });
   };
@@ -353,11 +387,13 @@ function App() {
           <button className={`tab-button ${activeTab === 'dashboard' ? 'active' : ''}`} onClick={() => setActiveTab('dashboard')}>
             Dashboard
           </button>
+          <button className={`tab-button ${activeTab === 'chatbot' ? 'active' : ''}`} onClick={() => setActiveTab('chatbot')}>
+            Chatbot
+          </button>
           <button className={`tab-button ${activeTab === 'docs' ? 'active' : ''}`} onClick={() => setActiveTab('docs')}>
             Documentación
           </button>
         </div>
-
         {activeTab === 'pipeline' && (
           <>
         <section className="split">
@@ -478,9 +514,14 @@ function App() {
               </p>
             </div>
             <div className="kpi-card">
-              <p className="card-label small">KPI</p>
-              <p className="card-value small">Δ precio publicado vs modelo (%)</p>
-              <p className="mini">Buscamos reducir el desvío y acelerar la rotación.</p>
+              <p className="card-label small">Precision modelo</p>
+              <p className="card-value small">
+                MAE: {typeof trainingModel.metrics?.mae === 'number' ? `USD ${trainingModel.metrics.mae.toFixed(0)}` : '-'}
+              </p>
+              <p className="card-value small">
+                MAPE: {typeof trainingModel.metrics?.mape_pct === 'number' ? `${trainingModel.metrics.mape_pct.toFixed(2)}%` : '-'}
+              </p>
+              <p className="mini">Actualiza al reentrenar para ver la precision vigente.</p>
             </div>
           </div>
 
@@ -496,13 +537,9 @@ function App() {
                 <li>Publicaciones subvaluadas que reducen margen o comisión.</li>
                 <li>Rotación ineficiente del inventario.</li>
               </ul>
-              <div className="value-box">
-                <p className="card-label">Solución con el modelo</p>
-                <p className="card-hint">
-                  Estima el precio óptimo usando ubicación, superficie, ambientes, tipo de propiedad, índice MI_DAN_AX03 y variables derivadas (distancias, densidad comercial, etc.).
-                </p>
-              </div>
             </div>
+
+
 
             <div className="card pricing-actions">
               <p className="card-label">Dataset del modelo</p>
@@ -649,22 +686,52 @@ function App() {
 
         {activeTab === 'dashboard' && (
           <section className="dashboard-section">
-            <div className="section-header">
+            <div className="section-header dashboard-header">
               <div>
                 <p className="card-label">Power BI</p>
                 <h3>Dashboard de propiedades</h3>
-                <p className="card-hint">Visualizaci�n embebida para seguir inventario, demanda y precios.</p>
+                <p className="card-hint">Visualización embebida para seguir inventario, demanda y precios.</p>
               </div>
+              <button className="secondary-button" onClick={handleDashboardFullscreen}>
+                Pantalla completa
+              </button>
             </div>
             <div className="dashboard-embed">
               <iframe
                 title="Reporte_Propiedades"
                 src="https://app.powerbi.com/reportEmbed?reportId=fe954fb7-74f8-4415-acca-5ae9e833df6d&autoAuth=true&ctid=344979d0-d31d-4c57-8ba0-491aff4acaed"
                 frameBorder="0"
+                allow="fullscreen"
                 allowFullScreen
+                ref={dashboardFrameRef}
               />
             </div>
-            <p className="mini status">Si no ves el dashboard, valida tus permisos en Power BI o abre en una pesta�a separada.</p>
+            <p className="mini status">Si no ves el dashboard, valida tus permisos en Power BI o abre en una pestaña separada.</p>
+          </section>
+        )}
+
+        {activeTab === 'chatbot' && (
+          <section className="chatbot-section">
+            <div className="section-header chatbot-header">
+              <div>
+                <p className="card-label">Asistente</p>
+                <h3>Chatbot de soporte</h3>
+                <p className="card-hint">Interactua con el asistente para consultas del pipeline y datos.</p>
+              </div>
+              <button className="secondary-button" onClick={handleChatbotFullscreen}>
+                Pantalla completa
+              </button>
+            </div>
+            <div className="chatbot-embed">
+              <iframe
+                title="Chatbot PowerApps"
+                src="https://apps.powerapps.com/play/9ca54f1a-b1af-4414-a59e-cd0edc657ab4?source=iframe"
+                frameBorder="0"
+                allow="fullscreen"
+                ref={chatbotFrameRef}
+              />
+            </div>
+            <p className="mini status">Si no carga, abre en una pestana nueva o revisa tus permisos de acceso.</p>
           </section>
         )}
 
@@ -724,12 +791,8 @@ function App() {
               </div>
               <div id="doc-metrics" className="card docs-card">
                 <p className="card-label">Interpretación</p>
-                <h4>Métricas y lectura</h4>
                 <p className="doc-text">
-                  Métricas reportadas: MAE (error absoluto medio en USD) y MAPE (desvío relativo %). El KPI de negocio (Δ precio publicado vs modelo) muestra qué tan alineado está el precio de salida con la recomendación del modelo.
-                </p>
-                <p className="doc-text">
-                  Si el MAPE sube, revisa: 1) cambios en el mix de propiedades (barrios nuevos, tipologías atípicas), 2) outliers que no se filtraron, 3) necesidad de nuevas variables (amenities, antigüedad, piso, orientación). Reentrena cada vez que cambie la base o las features.
+                  M�tricas reportadas: MAE (error absoluto medio en USD) y MAPE (desv�o relativo %). El KPI de negocio (? precio publicado vs modelo) muestra qu� tan alineado est� el precio de salida con la recomendaci�n del modelo.
                 </p>
               </div>
               <div id="doc-checklist" className="card docs-card">
